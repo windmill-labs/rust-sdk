@@ -60,7 +60,7 @@ impl<S: Service<RoleServer>> ServiceExt<RoleServer> for S {
         ct: CancellationToken,
     ) -> impl Future<Output = Result<RunningService<RoleServer, Self>, E>> + Send
     where
-        T: IntoTransport<RoleServer, E, A>,
+        T: IntoTransport<RoleServer, E, A> + ProvidesAxiumExtensions,
         E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
         Self: Sized,
     {
@@ -74,7 +74,7 @@ pub async fn serve_server<S, T, E, A>(
 ) -> Result<RunningService<RoleServer, S>, E>
 where
     S: Service<RoleServer>,
-    T: IntoTransport<RoleServer, E, A>,
+    T: IntoTransport<RoleServer, E, A> + ProvidesAxiumExtensions,
     E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
 {
     serve_server_with_ct(service, transport, CancellationToken::new()).await
@@ -129,9 +129,11 @@ pub async fn serve_server_with_ct<S, T, E, A>(
 ) -> Result<RunningService<RoleServer, S>, E>
 where
     S: Service<RoleServer>,
-    T: IntoTransport<RoleServer, E, A>,
+    T: IntoTransport<RoleServer, E, A> + ProvidesAxiumExtensions,
     E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
 {
+    let req_extensions = transport.get_extensions().clone();
+    let workspace_id = transport.get_workspace_id();
     let (sink, stream) = transport.into_transport();
     let mut sink = Box::pin(sink);
     let mut stream = Box::pin(stream);
@@ -162,6 +164,8 @@ where
         meta: request.get_meta().clone(),
         extensions: request.extensions().clone(),
         peer: peer.clone(),
+        req_extensions: req_extensions.clone(),
+        workspace_id: workspace_id.clone(),
     };
     // Send initialize response
     let init_response = service.handle_request(request.clone(), context).await;
@@ -207,7 +211,16 @@ where
     };
     let _ = service.handle_notification(notification).await;
     // Continue processing service
-    serve_inner(service, (sink, stream), peer, peer_rx, ct).await
+    serve_inner(
+        service,
+        (sink, stream),
+        peer,
+        peer_rx,
+        ct,
+        req_extensions,
+        workspace_id,
+    )
+    .await
 }
 
 macro_rules! method {
