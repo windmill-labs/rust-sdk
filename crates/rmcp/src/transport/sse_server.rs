@@ -2,8 +2,8 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{Extensions, StatusCode},
     response::{
         Response,
         sse::{Event, KeepAlive, Sse},
@@ -32,13 +32,17 @@ struct App {
     txs: TxStore,
     transport_tx: tokio::sync::mpsc::UnboundedSender<SseServerTransport>,
     post_path: Arc<str>,
+    full_message_path: Arc<str>,
     sse_ping_interval: Duration,
+    ct: CancellationToken,
 }
 
 impl App {
     pub fn new(
         post_path: String,
+        full_message_path: String,
         sse_ping_interval: Duration,
+        ct: CancellationToken,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<SseServerTransport>,
@@ -49,7 +53,9 @@ impl App {
                 txs: Default::default(),
                 transport_tx,
                 post_path: post_path.into(),
+                full_message_path: full_message_path.into(),
                 sse_ping_interval,
+                ct,
             },
             transport_rx,
         )
@@ -88,6 +94,8 @@ async fn post_event_handler(
 
 async fn sse_handler(
     State(app): State<App>,
+    Path(workspace_id): Path<String>,
+    request: Request,
 ) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
     let session = session_id();
     tracing::info!(%session, "sse connection");
@@ -107,6 +115,8 @@ async fn sse_handler(
         sink,
         session_id: session.clone(),
         tx_store: app.txs.clone(),
+        req_extensions: request.extensions().clone(),
+        workspace_id: workspace_id.clone(),
     };
     let transport_send_result = app.transport_tx.send(transport);
     if transport_send_result.is_err() {
@@ -116,20 +126,65 @@ async fn sse_handler(
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return Err(response);
     }
-    let post_path = app.post_path.as_ref();
     let ping_interval = app.sse_ping_interval;
-    let stream = futures::stream::once(futures::future::ok(
-        Event::default()
-            .event("endpoint")
-            .data(format!("{post_path}?sessionId={session}")),
-    ))
-    .chain(ReceiverStream::new(to_client_rx).map(|message| {
-        match serde_json::to_string(&message) {
-            Ok(bytes) => Ok(Event::default().event("message").data(&bytes)),
-            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    let post_path = app.post_path.clone();
+    let full_endpoint_path = app
+        .full_message_path
+        .replace(":workspace_id", &workspace_id);
+    let server_ct = app.ct.clone();
+
+    // Clone variables needed for the cleanup task *before* they are moved by async_stream
+    let session_for_cleanup = session.clone();
+    let server_ct_for_cleanup = server_ct.clone();
+    let tx_store_for_cleanup = app.txs.clone();
+
+    let mut message_stream = ReceiverStream::new(to_client_rx);
+    let client_stream = async_stream::stream! {
+        yield Ok(Event::default()
+                .event("endpoint")
+                .data(format!("{full_endpoint_path}{post_path}?sessionId={session}")));
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = server_ct.cancelled() => {
+                    tracing::info!(%session, "SSE connection cancelled via token.");
+                    break;
+                }
+                maybe_message = message_stream.next() => {
+                    match maybe_message {
+                        Some(message) => {
+                            match serde_json::to_string(&message) {
+                                Ok(bytes) => yield Ok(Event::default().event("message").data(bytes)),
+                                Err(e) => {
+                                    tracing::error!(%session, "Failed to serialize message: {}", e);
+                                    yield Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::info!(%session, "Message channel closed, ending SSE stream.");
+                            break;
+                        }
+                    }
+                }
+            }
         }
-    }));
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
+        tracing::debug!(%session, "SSE client_stream finished.");
+    };
+
+    // Clean up the tx entry when the SSE connection handler finishes (either normally or cancelled)
+    tokio::spawn(async move {
+        server_ct_for_cleanup.cancelled().await;
+        tracing::debug!(session=%session_for_cleanup, "Removing session from tx store due to cancellation or handler exit.");
+        tx_store_for_cleanup
+            .write()
+            .await
+            .remove(&session_for_cleanup);
+    });
+
+    Ok(Sse::new(client_stream).keep_alive(KeepAlive::new().interval(ping_interval)))
 }
 
 pub struct SseServerTransport {
@@ -137,6 +192,18 @@ pub struct SseServerTransport {
     sink: PollSender<TxJsonRpcMessage<RoleServer>>,
     session_id: SessionId,
     tx_store: TxStore,
+    req_extensions: Extensions,
+    workspace_id: String,
+}
+
+impl crate::service::ProvidesAxiumExtensions for SseServerTransport {
+    fn get_extensions(&self) -> &Extensions {
+        &self.req_extensions
+    }
+
+    fn get_workspace_id(&self) -> String {
+        self.workspace_id.clone()
+    }
 }
 
 impl Sink<TxJsonRpcMessage<RoleServer>> for SseServerTransport {
@@ -207,6 +274,7 @@ pub struct SseServerConfig {
     pub post_path: String,
     pub ct: CancellationToken,
     pub sse_keep_alive: Option<Duration>,
+    pub full_message_path: String,
 }
 
 #[derive(Debug)]
@@ -223,6 +291,7 @@ impl SseServer {
             post_path: "/message".to_string(),
             ct: CancellationToken::new(),
             sse_keep_alive: None,
+            full_message_path: "/message".to_string(),
         })
         .await
     }
@@ -250,7 +319,9 @@ impl SseServer {
     pub fn new(config: SseServerConfig) -> (SseServer, Router) {
         let (app, transport_rx) = App::new(
             config.post_path.clone(),
+            config.full_message_path.clone(),
             config.sse_keep_alive.unwrap_or(DEFAULT_AUTO_PING_INTERVAL),
+            config.ct.clone(),
         );
         let router = Router::new()
             .route(&config.sse_path, get(sse_handler))
