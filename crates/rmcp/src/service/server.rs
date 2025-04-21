@@ -166,6 +166,7 @@ where
         peer: peer.clone(),
         req_extensions: req_extensions.clone(),
         workspace_id: workspace_id.clone(),
+        tools: None,
     };
     // Send initialize response
     let init_response = service.handle_request(request.clone(), context).await;

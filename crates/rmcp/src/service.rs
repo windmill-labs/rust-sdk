@@ -7,7 +7,7 @@ use crate::{
         CancelledNotification, CancelledNotificationParam, Extensions, GetExtensions, GetMeta,
         JsonRpcBatchRequestItem, JsonRpcBatchResponseItem, JsonRpcError, JsonRpcMessage,
         JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, Meta, NumberOrString, ProgressToken,
-        RequestId, ServerJsonRpcMessage,
+        RequestId, ServerJsonRpcMessage, Tool,
     },
     transport::IntoTransport,
 };
@@ -489,6 +489,13 @@ pub struct RequestContext<R: ServiceRole> {
     pub peer: Peer<R>,
     pub req_extensions: AxumExtensions,
     pub workspace_id: String,
+    pub tools: Option<Vec<Tool>>
+}
+
+impl<R: ServiceRole> RequestContext<R> {
+    pub fn set_tools(&mut self, tools: Vec<Tool>) {
+        self.tools = Some(tools);
+    }
 }
 
 /// Use this function to skip initialization process
@@ -699,6 +706,7 @@ where
                             extensions: request.extensions().clone(),
                             req_extensions: req_extensions.clone(),
                             workspace_id: workspace_id.clone(),
+                            tools: None,
                         };
                         tokio::spawn(async move {
                             let result = service.handle_request(request, context).await;
